@@ -1,0 +1,68 @@
+// AttributeTransform.compute — barycentric interpolation of control-point
+// deltas + final write to the wu.yize.gsplat GraphicsBuffers.
+//
+// Mirrors e:\HKUSTGZ\HoloSoul\webavatar-rust\src\shaders\attribute_transform.wgsl
+// but stays in (Position, Scale, Rotation) form: we skip the cov form
+// the Rust pipeline produces and write directly to the gsplat buffers
+// that GsplatRendererImpl expects (PositionBuffer, ScaleBuffer,
+// RotationBuffer, ColorBuffer).
+//
+//   for each splat i:
+//     delta = sum_{j=0..2} w[i*3+j] * ctrl_pt_deltas[knn[i*3+j]]
+//     pos = InPositions[i] + delta
+//     scale = exp(InLogScales[i])
+//     rot  = InRotations[i]   (already normalised by the LBS / basis passes)
+//     color = float4(InSh0[i], InOpacities[i])
+//     OutPositions[i] = pos
+//     OutScales[i]    = scale
+//     OutRotations[i] = rot
+//     OutColors[i]    = color
+
+#pragma kernel AttributeTransform
+
+cbuffer TransformParams {
+    uint SplatCount;
+};
+
+StructuredBuffer<float3> InPositions;
+StructuredBuffer<float3> InLogScales;
+StructuredBuffer<float4> InRotations;     // (w, x, y, z)
+StructuredBuffer<float3> InSh0;
+StructuredBuffer<float>  InOpacities;
+
+StructuredBuffer<uint>   GsCtrlKnn;       // SplatCount * 3, u16 in low bits
+StructuredBuffer<float>  GsCtrlKnnWeights;// SplatCount * 3
+StructuredBuffer<float3> CtrlPtDeltas;    // ControlPointCount
+
+RWStructuredBuffer<float3> OutPositions;  // gsplat PositionBuffer
+RWStructuredBuffer<float3> OutScales;     // gsplat ScaleBuffer
+RWStructuredBuffer<float4> OutRotations;  // gsplat RotationBuffer
+RWStructuredBuffer<float4> OutColors;     // gsplat ColorBuffer (RGBA)
+
+[numthreads(256, 1, 1)]
+void AttributeTransform(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= SplatCount) return;
+
+    // Interpolated control-point position offset (Eq.4 in the paper).
+    uint  knnBase = i * 3;
+    uint  wBase   = i * 3;
+    float3 posDelta = 0;
+    [unroll] for (uint j = 0; j < 3; ++j)
+    {
+        uint  ctrlIdx = GsCtrlKnn[knnBase + j] & 0xFFFFu;
+        float w       = GsCtrlKnnWeights[wBase + j];
+        posDelta += w * CtrlPtDeltas[ctrlIdx];
+    }
+
+    float3 pos   = InPositions[i] + posDelta;
+    float3 scale = exp(InLogScales[i]);
+    float4 rot   = InRotations[i];
+    float4 color = float4(InSh0[i], InOpacities[i]);
+
+    OutPositions[i] = pos;
+    OutScales[i]    = scale;
+    OutRotations[i] = rot;
+    OutColors[i]    = color;
+}

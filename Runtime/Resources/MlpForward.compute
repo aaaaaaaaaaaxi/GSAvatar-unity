@@ -1,0 +1,93 @@
+// MlpForward.compute — per-part MLP forward inference.
+//
+// Mirrors e:\HKUSTGZ\HoloSoul\webavatar-rust\src\shaders\mlp.wgsl.
+// One compute pass per layer; the first layer reads from a 80-float
+// pose cbuffer (63 pose floats + 1 pad + 16 expression floats), later
+// layers read from the input ping-pong buffer.
+//
+// The same kernel handles both the "first layer" (read from cbuffer)
+// and "hidden layer" (read from StructuredBuffer) by selecting with a
+// uniform.  This keeps the bind-group layout uniform across layers.
+//
+// Weights / biases for all layers are stored in a single large buffer
+// (`InW` / `InB`); per-layer offsets come in via _WeightOffset /
+// _BiasOffset uniforms.  Layout is [num_mlps, Out, In] (the C# side
+// permutes layer 0's NPZ layout [Out, num_mlps, In] to match).
+//
+//   Y[mlp_i * out + out_j] = activation(
+//       sum_{k=0..in-1}  W[_WeightOffset + ((mlp_i * out) + out_j) * in + k] * X[k]
+//       + B[_BiasOffset + mlp_i * out + out_j],
+//       activation_type)
+//
+// For mlp_i >= NumHeadParts, the first layer's expression coefficients
+// (k >= 63) are masked out — non-head MLPs do not consume expression.
+//
+// Dispatch shape:
+//   [numthreads(64, 1, 1)]
+//   Dispatch((OutFeatures + 63) / 64, NumMlps, 1)
+
+#pragma kernel MlpForward
+
+// All constants live in one cbuffer so SetVectorArray("_Pose", ...) and
+// the scalar SetInt / SetVector calls land in the same constant buffer
+// — Unity's ComputeShader API does not always address multiple named
+// cbuffers correctly across backends.
+cbuffer MlpParams {
+    uint  InFeatures;
+    uint  OutFeatures;
+    uint  Activation;     // 0 = none, 1 = leaky relu (matches Rust)
+    uint  NumMlps;
+    uint  NumHeadParts;   // mlp_i >= NumHeadParts ignores expression slots
+    uint  NumPoseDim;     // 63 — first-layer pose length (excl. expression)
+    uint  UsePoseUniform; // 1 = read from cbuffer pose, 0 = read from InX
+    uint  _WeightOffset;  // float offset into InW for this layer
+    uint  _BiasOffset;    // float offset into InB for this layer
+    float4 _Pose[20];     // 80 floats total: pose(64) + expression(16)
+};
+
+StructuredBuffer<float>    InX;
+StructuredBuffer<float>    InW;
+StructuredBuffer<float>    InB;
+RWStructuredBuffer<float>  OutY;
+
+float activation(float x, uint kind)
+{
+    if (kind == 1u) return max(0.01 * x, x); // leaky relu
+    return x;
+}
+
+[numthreads(64, 1, 1)]
+void MlpForward(uint3 id : SV_DispatchThreadID)
+{
+    uint out_j = id.x;
+    uint mlp_i = id.y;
+    if (mlp_i >= NumMlps || out_j >= OutFeatures) return;
+
+    float sum = 0.0;
+    uint wBase = _WeightOffset + (mlp_i * OutFeatures + out_j) * InFeatures;
+    for (uint k = 0; k < InFeatures; ++k)
+    {
+        float xVal;
+        if (UsePoseUniform == 1u)
+        {
+            // First layer: read from pose cbuffer; non-head MLPs mask
+            // the expression slot (k >= NumPoseDim == 63).
+            if (mlp_i >= NumHeadParts && k >= NumPoseDim)
+            {
+                xVal = 0.0;
+            }
+            else
+            {
+                xVal = _Pose[k / 4u][k % 4u];
+            }
+        }
+        else
+        {
+            xVal = InX[mlp_i * InFeatures + k];
+        }
+        sum += InW[wBase + k] * xVal;
+    }
+
+    float bias = InB[_BiasOffset + mlp_i * OutFeatures + out_j];
+    OutY[mlp_i * OutFeatures + out_j] = activation(sum + bias, Activation);
+}

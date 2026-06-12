@@ -1,0 +1,19 @@
+{
+    "name": "WebAvatarEditor",
+    "rootNamespace": "WebAvatar.Editor",
+    "references": [
+        "GUID:cd5af953dfb10d846bdff6ba5eb4a9d4",
+        "Gsplat"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

@@ -1,0 +1,98 @@
+// AttributeBasis.compute — blendshape deltas for rotation, log-scale, SH0.
+//
+// Mirrors e:\HKUSTGZ\HoloSoul\webavatar-rust\src\shaders\attribute_basis.wgsl.
+// Operates only on the "pruned" subset of Gaussians (those with non-zero
+// blendshape contributions).  All data is f32 in this port (the Rust
+// pipeline uses f16-packed storage for bandwidth).
+//
+// For each pruned index i (0..PrunedSplatCount):
+//   delta_rot[d]   = sum_{k=0..15} rotation_basis[(i*4+d)*16 + k] * coefs[featIdx * 32 + k]
+//   delta_scale[d] = sum_{k=0..15} scale_basis[(i*3+d)*16 + k]     * coefs[featIdx * 32 + k]
+//   delta_color[d] = sum_{k=0..15} color_basis[(i*3+d)*16 + k]     * coefs[featIdx * 32 + k]
+//   target_gauss_idx = prune_indices.{rot,scale,color}_idxs[i]
+//   OutRotations[target_gauss_idx]   += delta_rot
+//   OutLogScales[target_gauss_idx]   += delta_scale
+//   OutSh0[target_gauss_idx]         += delta_color
+//
+// Rotation is renormalised after the add (defensive — wu.yize.gsplat's
+// QuatToMat3 uses the R+R trick so an off-by-magnitude quat still
+// produces a valid rotation, but the deltas are intended to be small).
+
+#pragma kernel AttributeBasis
+
+cbuffer AttrBasisParams {
+    uint PrunedSplatCount;
+    uint CoefStride;       // = 32 — coefs per mlp
+};
+
+StructuredBuffer<uint>   GsFeatKnn;         // (N,) — u16 packed in low bits
+StructuredBuffer<uint>   PruneIndices;      // 3 * PrunedSplatCount, [rot|scale|color]
+StructuredBuffer<float>  RotationBasis;     // PrunedSplatCount * 4 * 16
+StructuredBuffer<float>  ScaleBasis;        // PrunedSplatCount * 3 * 16
+StructuredBuffer<float>  ColorBasis;        // PrunedSplatCount * 3 * 16
+StructuredBuffer<float>  Coefs;             // num_mlps * 32
+
+RWStructuredBuffer<float4> OutRotations;    // (N,) — quaternion (w, x, y, z)
+RWStructuredBuffer<float3> OutLogScales;
+RWStructuredBuffer<float3> OutSh0;
+
+[numthreads(256, 1, 1)]
+void AttributeBasis(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= PrunedSplatCount) return;
+
+    uint rotIdx   = PruneIndices[i];
+    uint scaleIdx = PruneIndices[PrunedSplatCount + i];
+    uint colorIdx = PruneIndices[2 * PrunedSplatCount + i];
+
+    uint rotFeat   = GsFeatKnn[rotIdx]   & 0xFFFFu;
+    uint scaleFeat = GsFeatKnn[scaleIdx] & 0xFFFFu;
+    uint colorFeat = GsFeatKnn[colorIdx] & 0xFFFFu;
+
+    // ---- rotation delta (4 components) ----
+    float4 dRot = 0;
+    uint rotBase = i * 4 * 16;
+    uint rotCoefBase = rotFeat * CoefStride;
+    for (uint d = 0; d < 4; ++d)
+    {
+        uint bOff = rotBase + d * 16;
+        uint cOff = rotCoefBase;
+        float s = 0;
+        for (uint k = 0; k < 16; ++k) s += RotationBasis[bOff + k] * Coefs[cOff + k];
+        dRot[d] = s;
+    }
+    float4 q = OutRotations[rotIdx] + dRot;
+    // Normalise defensively.
+    float qLen = sqrt(dot(q, q));
+    if (qLen > 1e-12) q /= qLen;
+    OutRotations[rotIdx] = q;
+
+    // ---- scale delta (3 components) ----
+    float3 dScale = 0;
+    uint scaleBase = i * 3 * 16;
+    uint scaleCoefBase = scaleFeat * CoefStride;
+    for (uint d = 0; d < 3; ++d)
+    {
+        uint bOff = scaleBase + d * 16;
+        uint cOff = scaleCoefBase;
+        float s = 0;
+        for (uint k = 0; k < 16; ++k) s += ScaleBasis[bOff + k] * Coefs[cOff + k];
+        dScale[d] = s;
+    }
+    OutLogScales[scaleIdx] += dScale;
+
+    // ---- color / SH0 delta (3 components) ----
+    float3 dColor = 0;
+    uint colorBase = i * 3 * 16;
+    uint colorCoefBase = colorFeat * CoefStride;
+    for (uint d = 0; d < 3; ++d)
+    {
+        uint bOff = colorBase + d * 16;
+        uint cOff = colorCoefBase;
+        float s = 0;
+        for (uint k = 0; k < 16; ++k) s += ColorBasis[bOff + k] * Coefs[cOff + k];
+        dColor[d] = s;
+    }
+    OutSh0[colorIdx] += dColor;
+}

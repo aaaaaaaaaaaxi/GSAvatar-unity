@@ -1,0 +1,10 @@
+{
+  "name": "org.webavatar.runtime",
+  "version": "0.1.0",
+  "displayName": "WebAvatar",
+  "description": "Loads 3D Gaussian Splatting avatar models (NPZ) and pose sequences (JSON) exported by the webavatar-rust pipeline, then drives a pose-animated 3DGS avatar via the wu.yize.gsplat renderer.",
+  "author": "HoloSoul",
+  "dependencies": {
+    "wu.yize.gsplat": "1.1.2"
+  }
+}

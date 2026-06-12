@@ -1,0 +1,45 @@
+// AttributeDxyz.compute — per-control-point position deltas.
+//
+// Mirrors e:\HKUSTGZ\HoloSoul\webavatar-rust\src\shaders\attribute_dxyz.wgsl.
+// Computes δx at every control point of the model, then caches the
+// result so the attribute-transform pass can interpolate.
+//
+// For each control point v in 0..ControlPointCount:
+//   delta[d] = ctrl_pt_offsets[v][d]
+//            + sum_{k=0..15} ctrl_pt_basis[(v*3+d)*16 + k] * coefs[featIdx*32 + 16 + k]
+// (i.e. deltas use the second half of the per-mlp feature vector)
+// OutCtrlPtDeltas[v] = delta
+
+#pragma kernel AttributeDxyz
+
+cbuffer DxyzParams {
+    uint ControlPointCount;
+    uint CoefStride; // 32
+};
+
+StructuredBuffer<uint>   CtrlFeatKnn;       // (V,) — u16 in low bits
+StructuredBuffer<float>  CtrlPtBasis;       // V * 3 * 16
+StructuredBuffer<float3> CtrlPtOffsets;     // (V,)
+StructuredBuffer<float>  Coefs;             // num_mlps * 32
+
+RWStructuredBuffer<float3> OutCtrlPtDeltas;
+
+[numthreads(256, 1, 1)]
+void AttributeDxyz(uint3 id : SV_DispatchThreadID)
+{
+    uint v = id.x;
+    if (v >= ControlPointCount) return;
+
+    uint featIdx = CtrlFeatKnn[v] & 0xFFFFu;
+    uint coefBase = featIdx * CoefStride + 16u; // dxyz uses second half of coefs
+
+    float3 delta = CtrlPtOffsets[v];
+    for (uint d = 0; d < 3; ++d)
+    {
+        uint bOff = (v * 3 + d) * 16;
+        float s = 0;
+        for (uint k = 0; k < 16; ++k) s += CtrlPtBasis[bOff + k] * Coefs[coefBase + k];
+        delta[d] += s;
+    }
+    OutCtrlPtDeltas[v] = delta;
+}

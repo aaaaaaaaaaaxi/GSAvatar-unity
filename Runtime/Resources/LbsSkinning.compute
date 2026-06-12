@@ -1,0 +1,207 @@
+// LbsSkinning.compute — per-splat 4-joint Linear Blend Skinning.
+//
+// Mirrors the WGSL kernel at e:\HKUSTGZ\HoloSoul\webavatar-rust\src\shaders\lbs.wgsl
+// but operates in (Position, Rotation) form rather than going through the
+// covariance form used by the Rust pipeline — the downstream
+// wu.yize.gsplat renderer wants (Position, Scale, Rotation, Color), so
+// staying in this form skips a cov→rot/scale expansion step.
+//
+//   new_pos  = R_global * (G_weight * pos_canonical) + t_global
+//   new_rot  = q_global * q_G * q_canonical
+//
+// _SplatCount    — total number of Gaussians (set per dispatch).
+// _JointMats     — 55 joint skinning matrices, packed column-major as
+//                  220 float4 (4 columns per matrix).  Element
+//                  [i*4+col] is column `col` of joint `i`.
+// _GlobalMat     — global rigid transform (rot 3x3 + transl in 4th col).
+//
+// Inputs are the canonical splat buffer (constant for a given avatar);
+// outputs overwrite the per-frame LBS buffer that the attribute stages
+// consume.
+
+#pragma kernel LbsSkinning
+#pragma pack_matrix(column_major)
+
+cbuffer LbsParams {
+    uint    _SplatCount;
+    float4  _GlobalMat0;   // 4 columns of the global 4x4 matrix
+    float4  _GlobalMat1;
+    float4  _GlobalMat2;
+    float4  _GlobalMat3;
+};
+
+StructuredBuffer<float4> _JointMats;     // 55 * 4 float4, column-major
+StructuredBuffer<float3> InPositions;
+StructuredBuffer<float4> InRotations;   // canonical quaternions (w, x, y, z)
+StructuredBuffer<uint>   WeightsVal;    // 4x u8 packed as u32
+StructuredBuffer<uint>   WeightsIdx;    // 4x u8 joint indices packed as u32
+
+RWStructuredBuffer<float3> OutPositions;
+RWStructuredBuffer<float4> OutRotations;
+
+float4 qmul(float4 a, float4 b)
+{
+    // Hamilton product in the gsplat convention: scalar at .x, vector at .yzw.
+    // i.e. q = (w, x, y, z) packed as float4(.x, .y, .z, .w).
+    //
+    // The wu.yize.gsplat shader's QuatToMat3 reads the rotation buffer with
+    // this exact layout (R.x = w, R.yzw = (x, y, z)), and InRotations is
+    // populated in the same order from the NPZ.  Using the Unity (.w-scalar)
+    // convention here silently corrupted every Gaussian's orientation —
+    // shoulders/hips ended up with the largest mismatch because their G
+    // matrices have the most non-trivial rotation.
+    float  s = a.x * b.x - dot(a.yzw, b.yzw);
+    float3 v = a.x * b.yzw + b.x * a.yzw + cross(a.yzw, b.yzw);
+    return float4(s, v);
+}
+
+float4 quat_from_mat3(float3x3 m)
+{
+    // Shepperd / Shoemake-style matrix-to-quat, packing scalar at .x to
+    // match the gsplat (w, x, y, z) layout.
+    float trace = m[0][0] + m[1][1] + m[2][2];
+    float4 q;
+    if (trace > 0.0)
+    {
+        float s = sqrt(trace + 1.0) * 2.0; // 4 * qw
+        q.x = 0.25 * s;
+        q.y = (m[2][1] - m[1][2]) / s;
+        q.z = (m[0][2] - m[2][0]) / s;
+        q.w = (m[1][0] - m[0][1]) / s;
+    }
+    else if (m[0][0] > m[1][1] && m[0][0] > m[2][2])
+    {
+        float s = sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2.0;
+        q.x = (m[2][1] - m[1][2]) / s;
+        q.y = 0.25 * s;
+        q.z = (m[0][1] + m[1][0]) / s;
+        q.w = (m[0][2] + m[2][0]) / s;
+    }
+    else if (m[1][1] > m[2][2])
+    {
+        float s = sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2.0;
+        q.x = (m[0][2] - m[2][0]) / s;
+        q.y = (m[0][1] + m[1][0]) / s;
+        q.z = 0.25 * s;
+        q.w = (m[1][2] + m[2][1]) / s;
+    }
+    else
+    {
+        float s = sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2.0;
+        q.x = (m[1][0] - m[0][1]) / s;
+        q.y = (m[0][2] + m[2][0]) / s;
+        q.z = (m[1][2] + m[2][1]) / s;
+        q.w = 0.25 * s;
+    }
+    return q;
+}
+
+float4x4 load_joint_mat(uint i)
+{
+    uint o = i * 4;
+    return float4x4(_JointMats[o + 0],
+                    _JointMats[o + 1],
+                    _JointMats[o + 2],
+                    _JointMats[o + 3]);
+}
+
+float4x4 load_global_mat()
+{
+    return float4x4(_GlobalMat0, _GlobalMat1, _GlobalMat2, _GlobalMat3);
+}
+
+[numthreads(256, 1, 1)]
+void LbsSkinning(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _SplatCount) return;
+
+    uint packedW = WeightsVal[i];
+    uint packedI = WeightsIdx[i];
+    float4 w = float4(packedW & 0xFFu,
+                      (packedW >>  8u) & 0xFFu,
+                      (packedW >> 16u) & 0xFFu,
+                      (packedW >> 24u) & 0xFFu) / 255.0;
+    uint4 idxs = uint4(packedI & 0xFFu,
+                       (packedI >>  8u) & 0xFFu,
+                       (packedI >> 16u) & 0xFFu,
+                       (packedI >> 24u) & 0xFFu);
+
+    // G_weight = sum_k w_k * G_k  (4-joint blend) — used for POSITION only.
+    // For a point, Gw * p = sum_k w_k * (R_k * p + t_k), which is the
+    // standard LBS formula for points and is fine even though Gw is not
+    // itself a rigid transform.
+    float4x4 Gw = 0.0;
+    [unroll] for (int k = 0; k < 4; ++k) Gw += w[k] * load_joint_mat(idxs[k]);
+
+    // Position: G_weight * pos_canonical, then global rigid transform.
+    float4 posPose = mul(Gw, float4(InPositions[i], 1.0));
+    float4 posGlobal = mul(load_global_mat(), posPose);
+    OutPositions[i] = posGlobal.xyz;
+
+    // Rotation: dual-LBS-style quaternion blend.
+    //
+    // We CANNOT use `quat_from_mat3((float3x3)Gw)`.  The weighted sum of
+    // rotation matrices is generally not a rotation matrix — it loses
+    // orthogonality as soon as more than one joint contributes — and
+    // feeding a non-orthogonal matrix through the Shepperd/Shoemake
+    // trace formula produces a meaningless quaternion.
+    //
+    // This is exactly what was distorting the limbs while leaving the
+    // head and torso untouched:
+    //   - Head splats put ~1.0 weight on joint 15 (neck/head),
+    //     so Gw ≈ G_15 stays a pure rotation and the wrong code path
+    //     happens to give the right answer.
+    //   - Torso splats put ~1.0 weight on joints 0/3/6/9 (spine),
+    //     same story.
+    //   - Shoulder/elbow/hip/knee splats split their weights across
+    //     joints whose rotations differ wildly (e.g. shoulder ↔ upper
+    //     arm at a 90° pose), so Gw is highly non-orthogonal and the
+    //     quaternion extraction returns garbage.  Those are the
+    //     regions visibly broken in the screenshots.
+    //
+    // The Rust reference pipeline sidesteps this by operating in
+    // covariance form (new_cov = Gw · cov · Gw^T), where the non-
+    // orthogonality of Gw is meaningful (it encodes the implicit
+    // scale stretch).  We can't do that here because gsplat-unity
+    // wants (position, scale, rotation, color) — we have to hand it
+    // a proper unit quaternion.
+    //
+    // Standard fix: extract a quaternion from EACH joint's G_k first
+    // (each G_k IS a rigid transform, so its 3x3 block is a real
+    // rotation matrix), then linearly blend the quaternions with
+    // sign consistency (so antipodal representations of the same
+    // rotation don't cancel out during the sum), and normalize.
+    //
+    // Sign-consistency reference is the CUMULATIVE running sum qG
+    // (not just q0).  For hand/foot splats the dominant joint is
+    // the wrist/ankle, and the secondary joints are the finger/toe
+    // MCPs — those can be nearly perpendicular to the wrist when
+    // the wrist is twisted (forearm supination, foot rotation) and
+    // the dot product sits right at the q0-vs-q_k sign-flip boundary
+    // (cos(θ/2) ≈ 0).  A q0-only reference picks the wrong sign
+    // there, and after `normalize()` the resulting qG rotates the
+    // whole blend by ~180° on the affected splats.  Using the
+    // running weighted sum as the reference gives a stable, smooth
+    // "average" rotation that subsequent q_k can be folded into
+    // without the boundary instability.
+    float4 qG = w[0] * quat_from_mat3((float3x3)load_joint_mat(idxs[0]));
+    [unroll] for (int k = 1; k < 4; ++k)
+    {
+        float4 q_k = quat_from_mat3((float3x3)load_joint_mat(idxs[k]));
+        // dot(qG, q_k) is the *weighted* running sum vs the next
+        // quat — its sign is now anchored to a slowly-evolving
+        // average rather than to a single (possibly weakly-weighted)
+        // joint, so it stays well away from the ±0 boundary.
+        float s = (dot(qG, q_k) < 0.0) ? -1.0 : 1.0;
+        qG += w[k] * s * q_k;
+    }
+    qG = normalize(qG);
+
+    // q_new = q_global * q_G * q_canonical.
+    // The global matrix is a true rigid transform (rot 3x3 + transl),
+    // so the matrix-to-quat extraction here is still valid.
+    float4 qGlobal = quat_from_mat3((float3x3)load_global_mat());
+    float4 qC  = InRotations[i];
+    OutRotations[i] = qmul(qGlobal, qmul(qG, qC));
+}

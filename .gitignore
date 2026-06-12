@@ -1,0 +1,22 @@
+# Unity UPM package — typically nothing to ignore, but cover common cases.
+
+# IDE
+.vs/
+.idea/
+.vscode/
+*.csproj
+*.sln
+*.suo
+*.user
+
+# Build artifacts
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+
+# OS
+.DS_Store
+Thumbs.db
